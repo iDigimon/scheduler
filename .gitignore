@@ -1,23 +1,154 @@
-### AL ###
-#Template for AL projects for Dynamics 365 Business Central
-#launch.json folder
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# Editor/IDE
+.idea/
 .vscode/
-#Cache folder
-.alcache/
-#Symbols folder
-.alpackages/
-#Snapshots folder
-.snapshots/
-#Testing Output folder
-.output/
-#Extension App-file
-*.app
-#Rapid Application Development File
-rad.json
-#Translation Base-file
-*.g.xlf
-#License-files
-*.bclicense
-*.flf
-#Test results file
-TestResults.xml
+
+
+
+# ── Claude Code (Anthropic) ──
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.claude/skills/
+
+# ── Codex CLI (OpenAI) ──
+AGENTS.md
+AGENTS.override.md
+.codex/
+.codex/skills/
+
+# ── Gemini CLI (Google) ──
+GEMINI.md
+.gemini/
+.gemini/skills/
+
+# ── Cursor ──
+.cursorrules
+.cursor/
+.cursor/skills/
+.cursor/rules/
+
+# ── Windsurf (Codeium) ──
+.windsurfrules
+.windsurf/
+.windsurf/skills/
+.windsurf/rules/
+.codeiumignore
+
+# ── GitHub Copilot ──
+.github/copilot-instructions.md
+.github/instructions/*.instructions.md
+.github/skills/
+.copilot/skills/
+
+# ── Continue.dev ──
+.continue/
+.continue/skills/
+
+# ── Roo Code / Cline ──
+.roo/
+.roo/skills/
+.clinerules
+.cline/
+.cline/skills/
+
+# ── Aider ──
+.aider*
+.aider.conf.yml
+.aiderignore
+
+# ── OpenHands ──
+.openhands/
+
+# ── Trae (字节跳动) ──
+.trae/
+.trae/skills/
+
+# ── Kilo Code ──
+.kilocode/
+.kilocode/skills/
+
+# ── Kiro CLI ──
+.kiro/
+.kiro/skills/
+
+# ── OpenCode ──
+.opencode/
+.opencode/skills/
+
+# ── Goose ──
+.goose/
+.goose/skills/
+
+# ── Droid / Factory ──
+.factory/
+.factory/skills/
+
+# ── Amp / Antigravity / Clawdbot 等 ──
+.agents/
+.agent/
+.agent/skills/
+.clawd/
+.clawdbot/
+
+# ── MCP (Model Context Protocol) 配置 ──
+mcp.json
+mcp-config.json
+.mcp/
+
+# ── 通用 AI 工具会话/状态文件 ──
+# Claude Code 等会在工作目录创建的空边界文件
+.env
+.env.development
+.env.local
+.env.*
+package.json
+yarn.lock
+bun.lockb
+bunfig.toml
+composer.lock
+
+# ── AI 生成产物目录 ──
+ai-generated/
+ai_output/
+ai-artifacts/
+prompts/
+
+# ── 其他 AI 工具配置 ──
+.workbuddy/
+.workbuddy/skills/
+
+/data
+/bin
+/logs
+
+
+
