@@ -146,6 +146,11 @@ prompts/
 .workbuddy/
 .workbuddy/skills/
 
+# z.ai
+.zcode
+
+
+
 /data
 /bin
 /logs
