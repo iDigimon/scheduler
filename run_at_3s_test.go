@@ -2,119 +2,72 @@ package scheduler
 
 import (
 	"fmt"
-	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
-// TestRunAt_3Seconds 测试3秒后执行任务的功能
+// TestRunAt_3Seconds 验证运行中插入更早的任务会唤醒定时器。
 func TestRunAt_3Seconds(t *testing.T) {
-	// 创建调度器
-	s := New()
-	s.Start()
-	defer s.Stop()
-
-	// 创建WaitGroup以确保任务执行完成
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	// 标记任务是否执行
-	taskExecuted := false
-	executionTime := time.Time{}
-
-	// 设置3秒后执行的时间点
-	executeTime := time.Now().Add(3 * time.Second)
-
-	// 创建任务
-	err := s.RunAt("3s-task", "3秒后执行任务", executeTime, func() {
-		defer wg.Done()
-		taskExecuted = true
-		executionTime = time.Now()
-		fmt.Printf("✅ 任务在预期时间执行: %s\n", executionTime.Format("15:04:05.000"))
-	})
-
-	if err != nil {
-		t.Fatalf("❌ 创建3秒后执行的任务失败: %v", err)
-	}
-
-	// 等待3秒半，确保任务有足够的时间执行
-	t.Logf("等待3.5秒让任务执行...")
-	time.Sleep(3500 * time.Millisecond)
-
-	// 等待任务执行完成（如果尚未完成）
-	wg.Wait()
-
-	// 验证任务执行状态
-	if !taskExecuted {
-		t.Errorf("❌ 测试失败: 3秒后执行的任务未执行")
-	} else {
-		// 检查执行时间是否在预期范围内（允许100毫秒的误差）
-		timeDiff := executionTime.Sub(executeTime).Abs()
-		if timeDiff > 100*time.Millisecond {
-			t.Errorf("❌ 测试失败: 任务执行时间与预期偏差过大 (偏差: %v)", timeDiff)
-		} else {
-			t.Logf("✅ 测试通过: 3秒后执行的任务成功执行，执行时间偏差在允许范围内 (%v)", timeDiff)
+	synctest.Test(t, func(t *testing.T) {
+		s := New()
+		s.Start()
+		defer s.Stop()
+		start := time.Now()
+		if err := s.RunAt("later", "", start.Add(time.Hour), func() { t.Error("已移除任务仍被派发") }); err != nil {
+			t.Fatal(err)
 		}
-	}
+		synctest.Wait()
+		at := start.Add(3 * time.Second)
+		fired := make(chan time.Time, 1)
+		if err := s.RunAt("once", "", at, func() { fired <- time.Now() }); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		select {
+		case got := <-fired:
+			if !got.Equal(at) {
+				t.Errorf("实际执行时间 %v，期望 %v", got, at)
+			}
+		default:
+			t.Fatal("一次性任务未准时执行")
+		}
+		if err := s.Remove("later"); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		if len(s.Jobs()) != 0 {
+			t.Fatal("仍有未清理的任务")
+		}
+	})
 }
 
-// TestRunAt_MultipleTasks 测试同时添加多个3秒后执行的任务
 func TestRunAt_MultipleTasks(t *testing.T) {
-	// 创建调度器
-	s := New()
-	s.Start()
-	defer s.Stop()
-
-	// 创建WaitGroup以确保所有任务执行完成
-	var wg sync.WaitGroup
-	taskCount := 3
-	wg.Add(taskCount)
-
-	// 用于跟踪每个任务的执行状态
-	executedTasks := make(map[string]bool, taskCount)
-	var mu sync.Mutex // 保护共享变量
-
-	// 计算执行时间（3秒后）
-	executeTime := time.Now().Add(3 * time.Second)
-
-	// 添加多个任务
-	for i := 1; i <= taskCount; i++ {
-		taskID := fmt.Sprintf("multi-task-%d", i)
-		taskName := fmt.Sprintf("第%d个3秒后执行任务", i)
-		currentTaskID := taskID
-
-		err := s.RunAt(taskID, taskName, executeTime, func() {
-			defer wg.Done()
-			mu.Lock()
-			executedTasks[currentTaskID] = true
-			mu.Unlock()
-			fmt.Printf("✅ 多任务测试 - 任务 %s 执行完成\n", currentTaskID)
-		})
-
-		if err != nil {
-			t.Fatalf("❌ 创建多任务测试中的任务 %d 失败: %v", i, err)
+	synctest.Test(t, func(t *testing.T) {
+		s := New()
+		at := time.Now().Add(3 * time.Second)
+		fired := make(chan int, 3)
+		for i := range 3 {
+			if err := s.RunAt(fmt.Sprint(i), "", at, func() { fired <- i }); err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
-
-	// 等待4秒，确保所有任务有足够的时间执行
-	t.Logf("等待4秒让所有任务执行...")
-	time.Sleep(4 * time.Second)
-
-	// 等待所有任务执行完成
-	wg.Wait()
-
-	// 验证所有任务都已执行
-	mu.Lock()
-	defer mu.Unlock()
-	for i := 1; i <= taskCount; i++ {
-		taskID := fmt.Sprintf("multi-task-%d", i)
-		if !executedTasks[taskID] {
-			t.Errorf("❌ 测试失败: 多任务测试中的任务 %s 未执行", taskID)
+		s.Start()
+		defer s.Stop()
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		if len(fired) != 3 {
+			t.Fatalf("同时到期的任务只派发了 %d 个", len(fired))
 		}
-	}
-
-	// 如果所有任务都执行了，记录成功信息
-	if len(executedTasks) == taskCount {
-		t.Logf("✅ 测试通过: 所有%d个3秒后执行的任务都成功执行", taskCount)
-	}
+		var seen [3]bool
+		for range seen {
+			id := <-fired
+			if id < 0 || id >= len(seen) || seen[id] {
+				t.Fatalf("任务 ID 错误或重复派发：%d", id)
+			}
+			seen[id] = true
+		}
+	})
 }

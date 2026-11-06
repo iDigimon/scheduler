@@ -47,21 +47,7 @@ func (h *Heap[T]) Push(item T) {
 
 // Pop 移除并返回堆顶元素
 func (h *Heap[T]) Pop() T {
-	if len(h.items) == 0 {
-		var zero T
-		return zero
-	}
-
-	top := h.items[0]
-	last := len(h.items) - 1
-	h.items[0] = h.items[last]
-	h.items = h.items[:last]
-
-	if len(h.items) > 0 {
-		h.down(0)
-	}
-
-	return top
+	return h.Remove(0)
 }
 
 // Remove 移除指定索引的元素
@@ -71,25 +57,14 @@ func (h *Heap[T]) Remove(index int) T {
 		return zero
 	}
 
-	if index == len(h.items)-1 {
-		// 移除最后一个元素
-		item := h.items[index]
-		h.items = h.items[:index]
-		return item
-	}
-
 	item := h.items[index]
 	last := len(h.items) - 1
 	h.items[index] = h.items[last]
+	clear(h.items[last:])
 	h.items = h.items[:last]
-
-	// 可能需要上浮或下沉
-	if index > 0 && h.less(h.items[index], h.items[h.parent(index)]) {
-		h.up(index)
-	} else {
-		h.down(index)
+	if index < last {
+		h.fix(index)
 	}
-
 	return item
 }
 
@@ -99,11 +74,13 @@ func (h *Heap[T]) Update(index int, item T) {
 		return
 	}
 
-	oldItem := h.items[index]
 	h.items[index] = item
+	h.fix(index)
+}
 
-	// 判断需要上浮还是下沉
-	if h.less(item, oldItem) {
+// fix 根据父子节点恢复堆序，也支持指针元素的优先级已原地修改。
+func (h *Heap[T]) fix(index int) {
+	if index > 0 && h.less(h.items[index], h.items[h.parent(index)]) {
 		h.up(index)
 	} else {
 		h.down(index)

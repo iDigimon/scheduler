@@ -1,115 +1,98 @@
 package scheduler
 
 import (
-	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// ParseCrontab 解析 crontab 表达式并返回下一次执行时间的计算函数
-// crontab 表达式格式：分 时 日 月 周
-// 支持的特殊字符：*
-// 例如："0 0 * * *" 表示每天午夜执行
-func ParseCrontab(crontab string) (func(time.Time) time.Time, error) {
-	// 检查 crontab 表达式是否为空
-	if crontab == "" {
-		return nil, errors.New("crontab expression cannot be empty")
-	}
+type cronField int
 
-	// 分割 crontab 表达式
+const wildcard cronField = -1
+
+func (f cronField) matches(value int) bool {
+	return f == wildcard || int(f) == value
+}
+
+type cronRule struct {
+	minute, hour, day, month, weekday cronField
+}
+
+// ParseCrontab 解析“分 时 日 月 周”五个字段，支持 * 和精确整数。
+// 返回的函数按输入的时区查找严格晚于输入的匹配时刻，无解时返回零时间。
+func ParseCrontab(crontab string) (func(time.Time) time.Time, error) {
 	parts := strings.Fields(crontab)
 	if len(parts) != 5 {
-		return nil, errors.New("invalid crontab expression format, expected 5 fields")
+		return nil, fmt.Errorf("%w: expected 5 fields (minute hour day month weekday); seconds are not supported", ErrInvalidCrontab)
 	}
-
-	// 解析分钟、小时、日期、月份、星期字段
-	minuteStr := parts[0]
-	hourStr := parts[1]
-	dayOfMonthStr := parts[2]
-	monthStr := parts[3]
-	dayOfWeekStr := parts[4]
-
-	// 返回计算下一次执行时间的函数
-	return func(lastRun time.Time) time.Time {
-		// 从上次执行时间的下一分钟开始查找下一次执行时间
-		next := lastRun.Add(1 * time.Minute)
-		next = time.Date(next.Year(), next.Month(), next.Day(), next.Hour(), 0, 0, 0, next.Location())
-
-		// 最多查找一年
-		maxIterations := 366 * 24 // 最多检查一年的时间
-		iterations := 0
-
-		for iterations < maxIterations {
-			// 检查是否满足 crontab 规则
-			if matchesCrontabRule(next, minuteStr, hourStr, dayOfMonthStr, monthStr, dayOfWeekStr) {
-				return next
-			}
-
-			// 检查下一小时
-			next = next.Add(1 * time.Hour)
-			iterations++
+	var fields [5]cronField
+	for i, bounds := range [5][2]int{{0, 59}, {0, 23}, {1, 31}, {1, 12}, {0, 7}} {
+		if parts[i] == "*" {
+			fields[i] = wildcard
+			continue
 		}
-
-		// 如果在最大迭代次数内没有找到匹配的时间，返回默认时间
-		return time.Time{}
-	}, nil
+		n, err := strconv.ParseUint(parts[i], 10, 8)
+		if err != nil || int(n) < bounds[0] || int(n) > bounds[1] {
+			return nil, fmt.Errorf("%w: field %d (%q) must be * or %d..%d", ErrInvalidCrontab, i+1, parts[i], bounds[0], bounds[1])
+		}
+		fields[i] = cronField(n)
+	}
+	rule := cronRule{fields[0], fields[1], fields[2], fields[3], fields[4]}
+	if rule.weekday == 7 {
+		rule.weekday = 0
+	}
+	if rule.month != wildcard && rule.day != wildcard {
+		// 用闰年校验固定月日，保留 2 月 29 日。
+		lastDay := time.Date(2000, time.Month(rule.month)+1, 0, 0, 0, 0, 0, time.UTC).Day()
+		if int(rule.day) > lastDay {
+			return nil, fmt.Errorf("%w: month %d has no day %d", ErrInvalidCrontab, rule.month, rule.day)
+		}
+	}
+	return rule.next, nil
 }
 
-// matchesCrontabRule 检查给定时间是否满足 crontab 规则
-func matchesCrontabRule(t time.Time, minuteStr, hourStr, dayOfMonthStr, monthStr, dayOfWeekStr string) bool {
-	// 检查分钟
-	if !matchesField(t.Minute(), minuteStr) {
-		return false
+func (r cronRule) next(after time.Time) time.Time {
+	// 公历的闰年、日期和星期每 400 年重复一次。
+	limit := after.AddDate(400, 0, 0)
+	for t := after.Add(time.Nanosecond); !t.After(limit); {
+		var step time.Duration
+		switch {
+		case t.Second() != 0 || t.Nanosecond() != 0:
+			step = time.Minute - time.Duration(t.Second())*time.Second - time.Duration(t.Nanosecond())
+		case !r.month.matches(int(t.Month())) || !r.day.matches(t.Day()) || !r.weekday.matches(int(t.Weekday())):
+			step = time.Duration((24-t.Hour())*60-t.Minute()) * time.Minute
+		case !r.hour.matches(t.Hour()):
+			step = time.Duration(60-t.Minute()) * time.Minute
+		case !r.minute.matches(t.Minute()):
+			step = time.Duration((int(r.minute)-t.Minute()+60)%60) * time.Minute
+		default:
+			return t
+		}
+		next := t.Add(step)
+		// 跨越时区偏移变化时，从变化的瞬间重新匹配，兼容跳时和重复的分钟。
+		_, boundary := t.ZoneBounds()
+		if boundary.After(t) && boundary.Before(next) {
+			next = boundary
+		}
+		t = next
 	}
-
-	// 检查小时
-	if !matchesField(t.Hour(), hourStr) {
-		return false
-	}
-
-	// 检查日期
-	if !matchesField(t.Day(), dayOfMonthStr) {
-		return false
-	}
-
-	// 检查月份
-	if !matchesField(int(t.Month()), monthStr) {
-		return false
-	}
-
-	// 检查星期（注意：Go 的 time.Weekday 中星期日是 0，而 crontab 中通常星期日是 0 或 7）
-	dayOfWeek := int(t.Weekday())
-	if dayOfWeek == 0 { // 如果是星期日，也尝试匹配 7
-		return matchesField(7, dayOfWeekStr) || matchesField(0, dayOfWeekStr)
-	}
-	return matchesField(dayOfWeek, dayOfWeekStr)
+	return time.Time{}
 }
 
-// matchesField 检查给定值是否匹配字段规则
-func matchesField(value int, fieldRule string) bool {
-	// 如果规则是 *, 则匹配所有值
-	if fieldRule == "*" {
-		return true
-	}
-
-	// 尝试将规则解析为整数
-	ruleValue, err := strconv.Atoi(fieldRule)
-	if err == nil {
-		return value == ruleValue
-	}
-
-	// TODO: 支持更复杂的规则，如范围、列表、步长等
-	// 目前只支持 * 和精确值
-	return false
-}
-
-// GetNextRunTime 根据 crontab 表达式获取下一次执行时间
+// GetNextRunTime 返回当前时间之后的下一次匹配时刻。
 func GetNextRunTime(crontab string) (time.Time, error) {
-	nextRunFunc, err := ParseCrontab(crontab)
+	next, err := ParseCrontab(crontab)
 	if err != nil {
 		return time.Time{}, err
 	}
+	return nextCronTime(next, time.Now())
+}
 
-	return nextRunFunc(time.Now()), nil
+func nextCronTime(next func(time.Time) time.Time, after time.Time) (time.Time, error) {
+	t := next(after)
+	if t.IsZero() || !t.After(after) {
+		return time.Time{}, ErrNoNextRun
+	}
+	return t, nil
 }

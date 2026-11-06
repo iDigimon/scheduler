@@ -406,3 +406,24 @@ func TestJobHeapMirrorsScheduler(t *testing.T) {
 		t.Errorf("job 堆 Pop 序列 = %v, 期望 %v", order, want)
 	}
 }
+
+func TestPointerUpdateAndRelease(t *testing.T) {
+	a, b, c := 1, 2, 3
+	h := New(func(i, j *int) bool { return *i < *j })
+	h.Push(&a)
+	h.Push(&b)
+	h.Push(&c)
+	c = 0
+	h.Update(2, &c)
+	if h.Top() != &c {
+		t.Error("原地降低优先级值后没有上浮")
+	}
+	h.Remove(1)
+	h.Pop()
+	h.Remove(0)
+	for _, p := range h.items[:cap(h.items)] {
+		if p != nil {
+			t.Fatal("堆底层数组仍有已移除的指针")
+		}
+	}
+}

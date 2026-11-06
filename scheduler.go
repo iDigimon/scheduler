@@ -2,411 +2,299 @@ package scheduler
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/iDigimon/scheduler/internal/heap"
 )
 
+const minRepeatInterval = time.Minute
+
+// JobChecker 在派发前检查任务快照，返回 true 时结束任务。
 type JobChecker func(job *Job) bool
 
+// UntilTime 在计划执行时刻早于 t 时结束任务。
 func UntilTime(t time.Time) JobChecker {
-	return func(job *Job) bool {
-		return job.NextRun.Before(t)
-	}
+	return func(job *Job) bool { return job.NextRun.Before(t) }
 }
+
+// UntilDeadline 在计划执行时刻达到或超过截止时间时结束任务。
+func UntilDeadline(t time.Time) JobChecker {
+	return func(job *Job) bool { return !job.NextRun.Before(t) }
+}
+
+// UntilFreq 在已派发次数达到 execCount 时结束任务。
 func UntilFreq(execCount int) JobChecker {
-	return func(job *Job) bool {
-		return job.ExecutionCount >= execCount
-	}
+	return func(job *Job) bool { return job.ExecutionCount >= execCount }
 }
 
-// Scheduler 调度器
+type scheduledJob struct {
+	Job
+	nextCron func(time.Time) time.Time
+}
+
+// Scheduler 使用最小堆和一个定时器调度任务。
 type Scheduler struct {
-	jobs    *heap.Heap[*Job]
-	mu      sync.RWMutex
-	timer   *time.Timer
-	ctx     context.Context
-	cancel  context.CancelFunc
-	running bool
-	jobMap  map[string]*Job // 用于快速查找任务
-	wakeup  chan struct{}   // 用于唤醒调度器主循环的通道
+	mu     sync.RWMutex
+	jobs   *heap.Heap[*scheduledJob]
+	jobMap map[string]*scheduledJob
+	timer  *time.Timer // 每次 Start 使用独立的定时器和 context
+	cancel context.CancelFunc
 }
 
-// New 创建新的调度器
+// New 创建新的调度器。
 func New() *Scheduler {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// 创建以NextRun时间为比较条件的最小堆
-	jobHeap := heap.New(func(i, j *Job) bool {
-		return i.NextRun.Before(j.NextRun)
-	})
-
-	scheduler := &Scheduler{
-		jobs:   jobHeap,
-		ctx:    ctx,
-		cancel: cancel,
-		jobMap: make(map[string]*Job),
-		wakeup: make(chan struct{}, 1), // 带缓冲的通道，避免阻塞
-	}
-
-	return scheduler
+	s := &Scheduler{}
+	s.resetJobs()
+	return s
 }
 
-// Start 启动调度器
+func (s *Scheduler) resetJobs() {
+	s.jobs = heap.New(func(i, j *scheduledJob) bool { return i.NextRun.Before(j.NextRun) })
+	s.jobMap = make(map[string]*scheduledJob)
+}
+
+// Start 启动调度器，派发本轮登记的任务。运行中重复调用只启动一次。
 func (s *Scheduler) Start() {
 	s.mu.Lock()
-	if s.running {
-		s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.cancel != nil {
 		return
 	}
-	s.running = true
-	// 初始化定时器，确保不为空
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	s.timer = time.NewTimer(0)
 	s.updateTimer()
-	s.mu.Unlock()
-	go s.run()
+	go s.run(ctx, s.timer)
 }
 
-// Stop 停止调度器
+// Stop 停止运行中的调度器并清空本轮任务，已派发的回调可继续运行。
+// 停止后可为下一次 Start 登记新任务。
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if !s.running {
+	if s.cancel == nil {
 		return
 	}
-
-	s.running = false
 	s.cancel()
-	if s.timer != nil {
-		s.timer.Stop()
-	}
+	s.timer.Stop()
+	s.cancel = nil
+	s.timer = nil
+	s.resetJobs()
 }
 
-// RunAt 在指定时间执行任务
+// RunAt 在指定时间执行一次任务。
 func (s *Scheduler) RunAt(id, name string, t time.Time, fn func()) error {
-	job := &Job{
-		ID:      id,
-		Name:    name,
-		Func:    fn,
-		NextRun: t,
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// 检查是否已存在相同ID的任务
-	if _, exists := s.jobMap[id]; exists {
-		return ErrJobExists
-	}
-
-	// 使用优化的任务添加方法
-	s.addJob(job)
-
-	return nil
+	return s.addJob(&scheduledJob{Job: Job{ID: id, Name: name, Func: fn, NextRun: t}})
 }
 
-// Every 按固定间隔循环执行任务，支持可变参数的JobChecker
+// Every 按固定间隔循环派发任务，首次计划执行时刻为 startTime 加 interval。
+// interval 小于 60 秒时，注册失败并返回 ErrInvalidInterval。
 func (s *Scheduler) Every(id, name string, startTime time.Time, interval time.Duration, fn func(), checkers ...JobChecker) error {
-	// 最低一分钟
-	if interval < time.Minute {
+	if interval < minRepeatInterval {
 		return ErrInvalidInterval
 	}
-
-	job := &Job{
-		ID:       id,
-		Name:     name,
-		Func:     fn,
-		NextRun:  startTime.Add(interval),
-		Interval: interval,
-		Checkers: checkers,
+	job := Job{
+		ID: id, Name: name, Func: fn,
+		NextRun: startTime.Add(interval), Interval: interval, Checkers: checkers,
 	}
+	return s.addJob(&scheduledJob{Job: job})
+}
+
+// Crontab 使用“分 时 日 月 周”五段式表达式调度任务。
+// 带秒字段的表达式在注册时返回 ErrInvalidCrontab。
+func (s *Scheduler) Crontab(id, name, crontab string, fn func(), checkers ...JobChecker) error {
+	next, err := ParseCrontab(crontab)
+	if err != nil {
+		return err
+	}
+	t, err := nextCronTime(next, time.Now())
+	if err != nil {
+		return err
+	}
+	return s.addJob(&scheduledJob{
+		Job:      Job{ID: id, Name: name, Func: fn, NextRun: t, Crontab: crontab, Checkers: checkers},
+		nextCron: next,
+	})
+}
+
+func (s *Scheduler) addJob(job *scheduledJob) error {
+	if job.Func == nil {
+		return ErrNilJobFunc
+	}
+	for _, check := range job.Checkers {
+		if check == nil {
+			return ErrNilJobChecker
+		}
+	}
+	job.Checkers = slices.Clone(job.Checkers)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	// 检查是否已存在相同ID的任务
-	if _, exists := s.jobMap[id]; exists {
+	if _, exists := s.jobMap[job.ID]; exists {
 		return ErrJobExists
 	}
-
-	// 使用优化的任务添加方法
-	s.addJob(job)
-
+	s.jobs.Push(job)
+	s.jobMap[job.ID] = job
+	if s.jobs.Top() == job {
+		s.updateTimer()
+	}
 	return nil
 }
 
-// Remove 移除指定任务
+// Remove 移除指定任务。已派发的回调可继续运行。
 func (s *Scheduler) Remove(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	_, exists := s.jobMap[id]
+	job, exists := s.jobMap[id]
 	if !exists {
 		return ErrJobNotFound
 	}
-
-	// 在堆中找到该任务并移除
-	index := s.jobs.FindIndex(func(j *Job) bool {
-		return j.ID == id
-	})
-
-	if index >= 0 {
+	if s.jobs.Top() == job {
+		s.jobs.Pop()
+		s.updateTimer()
+	} else {
+		// 正在执行检查器的任务已经出堆，此时只需撤销 map 中的登记。
+		index := s.jobs.FindIndex(func(j *scheduledJob) bool { return j == job })
 		s.jobs.Remove(index)
 	}
-
 	delete(s.jobMap, id)
-	s.updateTimer()
-
 	return nil
 }
 
-// FindJob 根据ID查找任务并返回任务指针
-// 如果任务不存在，返回nil和ErrJobNotFound错误
+// FindJob 根据 ID 返回任务快照。
 func (s *Scheduler) FindJob(id string) (*Job, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
 	job, exists := s.jobMap[id]
 	if !exists {
 		return nil, ErrJobNotFound
 	}
-
-	// 返回任务的副本，避免外部直接修改内部状态
-	// 使用值复制而不是指针复制，确保返回的是新的指针
-	jobCopy := *job
-	return &jobCopy, nil
+	return job.snapshot(), nil
 }
 
-// Crontab 使用crontab表达式创建定时任务，支持可变参数的JobChecker
-// id: 任务ID
-// name: 任务名称
-// crontab: crontab表达式，格式为"分 时 日 月 周"
-// fn: 要执行的任务函数
-// checkers: 任务检查器列表，用于判断任务是否应该继续执行
-// 返回错误信息
-func (s *Scheduler) Crontab(id, name, crontab string, fn func(), checkers ...JobChecker) error {
-	// 解析crontab表达式
-	nextRunFunc, err := ParseCrontab(crontab)
-	if err != nil {
-		return fmt.Errorf("invalid crontab expression: %w", err)
-	}
-
-	// 获取下一次执行时间
-	nextRun := nextRunFunc(time.Now())
-	if nextRun.IsZero() {
-		return errors.New("failed to calculate next run time")
-	}
-
-	// 创建任务
-	job := &Job{
-		ID:       id,
-		Name:     name,
-		Func:     fn,
-		NextRun:  nextRun,
-		Crontab:  crontab,
-		Checkers: checkers,
-	}
-
-	// 添加任务到调度器
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// 检查是否已存在相同ID的任务
-	if _, exists := s.jobMap[id]; exists {
-		return ErrJobExists
-	}
-
-	// 使用优化的任务添加方法
-	s.addJob(job)
-
-	return nil
-}
-
-// Jobs 获取所有任务信息
+// Jobs 获取所有待执行任务的信息。
 func (s *Scheduler) Jobs() []JobInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
 	result := make([]JobInfo, 0, len(s.jobMap))
 	for _, job := range s.jobMap {
-		result = append(result, JobInfo{
-			ID:       job.ID,
-			Name:     job.Name,
-			NextRun:  job.NextRun,
-			Interval: job.Interval,
-		})
+		result = append(result, JobInfo{ID: job.ID, Name: job.Name, NextRun: job.NextRun, Interval: job.Interval})
 	}
-
 	return result
 }
 
-// run 调度器主循环
-func (s *Scheduler) run() {
+func (s *Scheduler) run(ctx context.Context, timer *time.Timer) {
 	for {
-		s.mu.Lock()
-		currentTimer := s.timer
-		s.mu.Unlock()
-
-		// 如果定时器为nil，重新初始化
-		if currentTimer == nil {
-			s.mu.Lock()
-			s.updateTimer()
-			s.mu.Unlock()
-			continue
-		}
-
-		// 等待定时器触发、上下文取消或唤醒信号
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			return
-		case <-currentTimer.C:
-			s.executeReadyJobs()
-			// 执行完任务后，必须重新获取timer以确保使用最新的定时器
-			continue
-		case <-s.wakeup:
-			// 收到唤醒信号，继续循环以获取新的定时器
+		case <-timer.C:
+			s.executeReadyJobs(ctx)
 		}
 	}
 }
 
-// executeReadyJobs 执行到期的任务
-func (s *Scheduler) executeReadyJobs() {
+func (s *Scheduler) executeReadyJobs(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
+	if ctx.Err() != nil {
+		return
+	}
 	now := time.Now()
-
-	for s.jobs.Len() > 0 {
-		job := s.jobs.Top()
-
-		// 如果最早的任务还没到执行时间，则退出
-		if job.NextRun.After(now) {
-			break
-		}
-
-		// 移除任务
+	for job := s.jobs.Top(); job != nil && !job.NextRun.After(now); job = s.jobs.Top() {
 		s.jobs.Pop()
-
-		// 检查是否应该继续执行该任务
-		shouldContinue := true
-		for _, checker := range job.Checkers {
-			if checker(job) {
-				shouldContinue = false
-				break
-			}
-		}
-
-		// 异步执行任务
-		if shouldContinue {
-			go func(j *Job) {
-				defer func() {
-					if r := recover(); r != nil {
-						// panic 仅打印日志，不传播，避免中断调度循环
-						fmt.Printf("任务 %s 执行出错: %v\n", j.Name, r)
-					}
-				}()
-				// 记录任务执行时间
-				j.LastRun = time.Now()
-				j.Func()
-				// 增加执行次数
-				j.ExecutionCount++
-			}(job)
-
-			// 根据任务类型决定是否重新调度
-			if job.Interval > 0 {
-				// 间隔循环任务
-				job.NextRun = now.Add(job.Interval)
-				s.jobs.Push(job)
-			} else if job.Crontab != "" {
-				// Crontab 任务
-				nextRunFunc, err := ParseCrontab(job.Crontab)
-				if err == nil {
-					nextRun := nextRunFunc(now)
-					if !nextRun.IsZero() {
-						job.NextRun = nextRun
-						s.jobs.Push(job)
-					}
-				}
-			} else {
-				// 一次性任务，从映射中删除
-				delete(s.jobMap, job.ID)
-			}
+		if len(job.Checkers) == 0 {
+			s.dispatch(job)
 		} else {
-			// 从jobMap中删除已结束的任务
-			delete(s.jobMap, job.ID)
+			// 检查期间仅保留 map 登记，同一任务最多有一轮检查在运行。
+			go s.checkJob(ctx, job, job.Job)
 		}
 	}
 	s.updateTimer()
 }
 
-// updateTimer 更新定时器
-// updateTimer 无条件更新定时器
-// 注意：此方法会无条件停止旧定时器并创建新定时器
-func (s *Scheduler) updateTimer() {
-	// 停止旧定时器（如果存在）
-	if s.timer != nil {
-		s.timer.Stop()
-	}
-
-	if s.jobs.Len() == 0 {
-		s.timer = time.NewTimer(time.Hour * 24 * 365) // 默认等待1年
-		return
-	}
-
-	nextJob := s.jobs.Top()
-	duration := time.Until(nextJob.NextRun)
-	if duration < 0 {
-		duration = 0
-	}
-
-	s.timer = time.NewTimer(duration)
-
-	// 唤醒主循环，让它重新获取新的定时器
-	// 使用select避免阻塞（如果通道已满）
-	select {
-	case s.wakeup <- struct{}{}:
-	default:
-	}
-}
-
-// addJob 添加任务并优化定时器更新
-// 只有当新添加的任务比当前最早任务更早时，才完全更新定时器
-func (s *Scheduler) addJob(job *Job) {
-	// 检查是否已存在相同ID的任务
-	if _, exists := s.jobMap[job.ID]; exists {
-		return
-	}
-
-	// 获取当前最早任务（如果有）
-	hasExistingJobs := s.jobs.Len() > 0
-	var earliestJob *Job
-	if hasExistingJobs {
-		earliestJob = s.jobs.Top()
-	}
-
-	// 添加新任务到堆和映射
-	s.jobs.Push(job)
-	s.jobMap[job.ID] = job
-
-	// 优化逻辑：只有在以下情况才完全更新定时器
-	// 1. 没有现有任务（首次添加任务）
-	// 2. 新添加的任务比当前最早任务更早
-	if !hasExistingJobs || job.NextRun.Before(earliestJob.NextRun) {
+// checkJob 在锁外按顺序调用当前任务的检查器，每个检查器使用独立快照。
+func (s *Scheduler) checkJob(ctx context.Context, job *scheduledJob, snapshot Job) {
+	stop := true
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("任务 %s 的检查器执行出错: %v\n", snapshot.Name, r)
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.jobMap[snapshot.ID] != job {
+			return // 检查期间已停止调度、删除任务或复用 ID
+		}
+		if stop {
+			delete(s.jobMap, snapshot.ID)
+		} else {
+			s.dispatch(job)
+		}
 		s.updateTimer()
-	} else {
-		// 即使不需要完全更新定时器，也发送唤醒信号让主循环确认当前状态
-		select {
-		case s.wakeup <- struct{}{}:
-		default:
+	}()
+
+	for _, check := range snapshot.Checkers {
+		if ctx.Err() != nil || check(snapshot.snapshot()) {
+			return
 		}
 	}
-
+	stop = false
 }
 
-// JobInfo 任务信息
+// dispatch 持写锁记录派发并安排下次执行，工作 goroutine 只接收名称和回调。
+func (s *Scheduler) dispatch(job *scheduledJob) {
+	now := time.Now()
+	job.LastRun = now
+	job.ExecutionCount++
+	go runJob(job.Name, job.Func)
+
+	switch {
+	case job.Interval > 0:
+		job.NextRun = now.Add(job.Interval)
+	case job.nextCron != nil:
+		next, err := nextCronTime(job.nextCron, now)
+		if err != nil {
+			delete(s.jobMap, job.ID)
+			return
+		}
+		// 上次派发可能晚于整分；保留下个匹配分钟，同时保证实际派发间隔。
+		earliest := now.Add(minRepeatInterval)
+		if next.Before(earliest) {
+			next = earliest
+		}
+		job.NextRun = next
+	default:
+		delete(s.jobMap, job.ID)
+		return
+	}
+	s.jobs.Push(job)
+}
+
+func runJob(name string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("任务 %s 执行出错: %v\n", name, r)
+		}
+	}()
+	fn()
+}
+
+// updateTimer 持写锁将当前代次的定时器对准堆顶，空堆时休眠。
+func (s *Scheduler) updateTimer() {
+	if s.timer == nil {
+		return
+	}
+	if job := s.jobs.Top(); job != nil {
+		s.timer.Reset(time.Until(job.NextRun))
+	} else {
+		s.timer.Stop()
+	}
+}
+
+// JobInfo 表示任务的基本调度信息。
 type JobInfo struct {
 	ID       string
 	Name     string

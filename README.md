@@ -52,10 +52,10 @@ func main() {
 		fmt.Println("一次性任务执行:", time.Now().Format("15:04:05"))
 	})
 
-	// 2) 循环任务：每 1 分钟执行一次（间隔必须 >= 1 分钟）
+	// 2) 循环任务：每分钟派发一次，达到截止时刻后结束
 	_ = s.Every("loop", "循环任务", time.Now(), time.Minute, func() {
 		fmt.Println("循环任务执行:", time.Now().Format("15:04:05"))
-	})
+	}, scheduler.UntilDeadline(time.Now().Add(10*time.Minute)))
 
 	// 3) Crontab 任务：每小时的第 0 分钟执行
 	_ = s.Crontab("cron", "Cron任务", "0 * * * *", func() {
@@ -74,16 +74,20 @@ func main() {
 | 方法 | 说明 |
 | --- | --- |
 | `New() *Scheduler` | 创建一个新的调度器实例 |
-| `(s *Scheduler) Start()` | 启动调度器（后台 goroutine） |
-| `(s *Scheduler) Stop()` | 停止调度器并取消上下文 |
+| `(s *Scheduler) Start()` | 启动调度器，派发本轮登记的任务 |
+| `(s *Scheduler) Stop()` | 停止运行中的调度器并清空本轮一次性、间隔和 Cron 任务 |
 | `(s *Scheduler) RunAt(id, name string, t time.Time, fn func()) error` | 在指定时间执行一次任务 |
-| `(s *Scheduler) Every(id, name string, startTime time.Time, interval time.Duration, fn func(), checkers ...JobChecker) error` | 按固定间隔循环执行；`interval` 必须 >= 1 分钟 |
+| `(s *Scheduler) Every(id, name string, startTime time.Time, interval time.Duration, fn func(), checkers ...JobChecker) error` | 首次计划时刻为 `startTime + interval`，`interval` 最小为 60 秒 |
 | `(s *Scheduler) Crontab(id, name, crontab string, fn func(), checkers ...JobChecker) error` | 使用 5 段式 crontab 表达式调度 |
 | `(s *Scheduler) Remove(id string) error` | 按 ID 移除任务 |
 | `(s *Scheduler) FindJob(id string) (*Job, error)` | 按 ID 查找任务（返回副本） |
 | `(s *Scheduler) Jobs() []JobInfo` | 返回所有任务的快照信息 |
 
-> 任务 ID 不可重复，相同 ID 会返回 `ErrJobExists`。
+> 任务 ID 不可重复，相同 ID 返回 `ErrJobExists`。注册时传入空回调或空 Checker 分别返回 `ErrNilJobFunc`、`ErrNilJobChecker`。
+
+重复任务在添加时校验频率。`Every` 的间隔小于 60 秒时立即返回 `ErrInvalidInterval`。Cron 按分钟配置，每 30 秒一次的六段表达式 `*/30 * * * * *` 在添加时返回 `ErrInvalidCrontab`。注册失败后可以用同一 ID 提交修正的规则。
+
+60 秒下限只约束同一任务的两次派发。10:00:30 添加 `* * * * *` 可以成功，首次计划在 10:01:00 派发；若准时派发，第二次计划在 10:02:00。
 
 ### JobChecker（终止条件）
 
@@ -96,7 +100,8 @@ type JobChecker func(job *Job) bool
 内置：
 
 - `scheduler.UntilTime(t time.Time) JobChecker` —— 当任务下次执行时间早于 `t` 时停止
-- `scheduler.UntilFreq(execCount int) JobChecker` —— 当执行次数达到 `execCount` 时停止
+- `scheduler.UntilDeadline(t time.Time) JobChecker` —— 当计划执行时间等于或晚于 `t` 时停止，截止时刻不派发
+- `scheduler.UntilFreq(execCount int) JobChecker` —— 当已派发次数达到 `execCount` 时停止，正在执行和发生 panic 的回调都计入
 
 自定义示例（分钟数为偶数时停止）：
 
@@ -109,7 +114,7 @@ s.Every("id", "name", time.Now(), time.Minute, fn, custom)
 
 ### Crontab 表达式
 
-采用标准 5 段格式：`分 时 日 月 周`，例如：
+采用 5 段格式：`分 时 日 月 周`，例如：
 
 | 表达式 | 含义 |
 | --- | --- |
@@ -122,14 +127,17 @@ s.Every("id", "name", time.Now(), time.Minute, fn, custom)
 - `scheduler.ParseCrontab(expr string) (func(time.Time) time.Time, error)` —— 解析表达式，返回下次执行时间计算函数
 - `scheduler.GetNextRunTime(expr string) (time.Time, error)` —— 获取从当前时间起的下一次执行时间
 
-> ⚠️ **当前限制**：crontab 解析目前仅支持 `*`（通配）和精确整数值，**暂不支持** 范围（`1-5`）、列表（`1,3,5`）、步长（`*/5`）等高级语法（见 `utils.go` 中的 TODO）。星期字段中周日既可用 `0` 也可用 `7` 表示。
+字段支持 `*` 和精确整数。分钟、小时、日期、月份、星期的范围分别为 0–59、0–23、1–31、1–12、0–7，周日可写 0 或 7。日期和星期同时指定时须同时匹配。例如 `0 0 1 * 1` 仅在每月一号恰逢周一时触发。越界值、不存在的月日及范围、列表、步长等语法均返回 `ErrInvalidCrontab`。
+
+`ParseCrontab` 返回的函数按输入时间的时区寻找严格晚于输入的匹配时刻。它支持闰日，跳过夏令时中不存在的分钟，也能找到回拨后重复出现的分钟。
 
 ## 任务执行模型
 
-- 任务到点后从堆顶弹出，在**独立 goroutine** 中异步执行（不阻塞调度循环）。
-- 执行过程中发生的 `panic` 会被 recover 捕获并打印，不会导致整个调度器崩溃。
-- 执行完成后，循环任务 / Crontab 任务会重新计算 `NextRun` 并重新入堆；一次性任务或被 Checker 终止的任务会从 `jobMap` 中删除。
-- 字段 `LastRun`、`ExecutionCount` 会在每次执行后更新。
+- 同一重复任务的两次派发至少相隔 **60 秒**，适用于 `Every` 和 `Crontab`。`Crontab` 首次对准下一个匹配的整分；续排时若距离上次实际派发不足 60 秒，则顺延至满 60 秒。例如每分钟任务延迟到 10:00:30 派发后，下一次最早在 10:01:30 派发。
+- `ExecutionCount` 和 `LastRun` 在派发时一同更新。回调在独立 goroutine 中运行，同一任务的多次回调可以重叠。回调 panic 会被捕获并打印，循环任务继续按规则调度。
+- 同一任务的 Checker 按注册顺序在锁外运行，各自获得独立的任务快照，可以查询或移除任务。不同任务的 Checker 可以并发运行。Checker 返回 `true` 或发生 panic 都会终止该任务。
+- `Stop()` 返回后即可复用旧 ID，首次启动前或停止后新登记的任务在下一次 `Start()` 时生效。运行中重复调用 `Start()`、停止后重复调用 `Stop()` 都是幂等的。
+- 停止时已经派发的回调可继续执行。正在运行的 Checker 可以返回，调度器会丢弃其结果。
 
 ## 项目结构
 
@@ -159,8 +167,9 @@ s.Every("id", "name", time.Now(), time.Minute, fn, custom)
 go build ./...
 go vet ./...
 
-# 运行测试（部分测试含较长 sleep，注意耗时）
+# 运行全部测试与竞态检测
 go test ./...
+go test -race ./...
 
 # 运行单个调度器测试
 go test -run TestJobChecker -v
